@@ -1,47 +1,19 @@
 # Copyright (C) Dominik Picheta. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
-import httpclient, parseopt, os, strutils, osproc, pegs, tables, parseutils,
+import future, httpclient, parseopt, os, strutils, osproc, pegs, tables, parseutils,
        strtabs, json, algorithm, sets
 
 from sequtils import toSeq
 
 import nimblepkg/packageinfo, nimblepkg/version, nimblepkg/tools,
-       nimblepkg/download, nimblepkg/config, nimblepkg/nimbletypes
+       nimblepkg/download, nimblepkg/config, nimblepkg/nimbletypes, nimblepkg/nimbleopts
+
+from nimblepkg/registry import nil
+from nimblepkg/file import nil
 
 when not defined(windows):
   from posix import getpid
-
-type
-  Options = object
-    forcePrompts: ForcePrompt
-    queryVersions: bool
-    queryInstalled: bool
-    action: Action
-    config: Config
-    nimbleData: JsonNode ## Nimbledata.json
-
-  ActionType = enum
-    actionNil, actionUpdate, actionInit, actionInstall, actionSearch,
-    actionList, actionBuild, actionPath, actionUninstall
-
-  Action = object
-    case typ: ActionType
-    of actionNil, actionList, actionBuild: nil
-    of actionUpdate:
-      optionalURL: string # Overrides default package list.
-    of actionInstall, actionPath, actionUninstall:
-      optionalName: seq[string] # \
-      # When this is @[], installs package from current dir.
-      packages: seq[PkgTuple] # Optional only for actionInstall.
-    of actionSearch:
-      search: seq[string] # Search string.
-    of actionInit:
-      projName: string
-    else:nil
-
-  ForcePrompt = enum
-    dontForcePrompt, forcePromptYes, forcePromptNo
 
 const
   help = """
@@ -60,6 +32,7 @@ Commands:
                [-i, --installed]  Lists all installed packages.
   path         pkgname ...        Shows absolute path to the installed packages
                                   specified.
+  register                        Register a package in the registry.
 
 Options:
   -h, --help                      Print this help message.
@@ -85,37 +58,6 @@ proc writeVersion() =
       [nimbleVersion, CompileDate, CompileTime])
   quit(QuitSuccess)
 
-proc getNimbleDir(options: Options): string =
-  options.config.nimbleDir
-
-proc getPkgsDir(options: Options): string =
-  options.config.nimbleDir / "pkgs"
-
-proc getBinDir(options: Options): string =
-  options.config.nimbleDir / "bin"
-
-proc prompt(options: Options, question: string): bool =
-  ## Asks an interactive question and returns the result.
-  ##
-  ## The proc will return immediately without asking the user if the global
-  ## forcePrompts has a value different than dontForcePrompt.
-  case options.forcePrompts
-  of forcePromptYes:
-    echo(question & " -> [forced yes]")
-    return true
-  of forcePromptNo:
-    echo(question & " -> [forced no]")
-    return false
-  of dontForcePrompt:
-    echo(question & " [y/N]")
-    let yn = stdin.readLine()
-    case yn.normalize
-    of "y", "yes":
-      return true
-    of "n", "no":
-      return false
-    else:
-      return false
 
 proc renameBabelToNimble(options: Options) {.deprecated.} =
   let babelDir = getHomeDir() / ".babel"
@@ -162,6 +104,8 @@ proc parseCmdLine(): Options =
         of "uninstall", "remove", "delete", "del", "rm":
           result.action.typ = actionUninstall
           result.action.packages = @[]
+        of "register":
+          result.action.typ = actionRegister
         else: writeHelp()
       else:
         case result.action.typ
@@ -196,6 +140,8 @@ proc parseCmdLine(): Options =
       of "reject", "n": result.forcePrompts = forcePromptNo
       of "ver": result.queryVersions = true
       of "installed", "i": result.queryInstalled = true
+      of "registryUrl": result.registryUrl = val
+      of "registryToken": result.registryToken = val
       else: discard
     of cmdEnd: assert(false) # cannot happen
   if result.action.typ == actionNil:
@@ -588,21 +534,21 @@ proc downloadPkg(url: string, verRange: VersionRange,
   doDownload(url, downloadDir, verRange, downMethod)
   result = downloadDir
 
-proc downloadPkg(pkg: Package, verRange: VersionRange): string =
+proc downloadPkg(pkg: Pkg, verRange: VersionRange): string =
   let downloadDir = (getNimbleTempDir() / getDownloadDirName(pkg, verRange))
-  let downMethod = pkg.downloadMethod.getDownloadMethod()
+  let downMethod = pkg.repository.checkUrlType()
   createDir(downloadDir)
   echo("Downloading ", pkg.name, " into ", downloadDir, " using ", downMethod,
       "...")
-  doDownload(pkg.url, downloadDir, verRange, downMethod)
+  doDownload(pkg.repository, downloadDir, verRange, downMethod)
   result = downloadDir
 
 proc install(packages: seq[PkgTuple],
              options: Options,
              doPrompt = true): tuple[paths: seq[string], pkg: PackageInfo] =
- if packages == @[]:
+  if packages == @[]:
     result = installFromDir(getCurrentDir(), false, options, "")
- else:
+  else:
     # If packages.json is not present ask the user if they want to download it.
     if not existsFile(options.getNimbleDir / "packages.json"):
       if doPrompt and
@@ -614,25 +560,36 @@ proc install(packages: seq[PkgTuple],
 
     # Install each package.
     for pv in packages:
+      var
+        downloadDir: string
+        pkg: Pkg
+
       if pv.name.isURL:
         let meth = checkUrlType(pv.name)
-        let downloadDir = downloadPkg(pv.name, pv.ver, meth)
+        downloadDir = downloadPkg(pv.name, pv.ver, meth)
         result = installFromDir(downloadDir, false, options, pv.name)
       else:
-        var pkg: Package
-        if getPackage(pv.name, options.getNimbleDir() / "packages.json", pkg):
-          let downloadDir = downloadPkg(pkg, pv.ver)
-          result = installFromDir(downloadDir, false, options, pkg.url)
+        if registry.getRegistryUrl(options) != nil:
+          pkg = registry.getPackage(options, pv.name)
+          downloadDir = downloadPkg(pkg, pv.ver)
+          result = installFromDir(downloadDir, false, options, pkg.repository)
         else:
-          # If package is not found give the user a chance to update
-          # package.json
-          if doPrompt and
-              options.prompt(pv.name & " not found in local packages.json, " &
-                             "check internet for updated packages?"):
-            update(options)
-            result = install(@[pv], options, false)
+          if file.getPackage(pv.name, options.getNimbleDir() / "packages.json", pkg):
+            downloadDir = downloadPkg(pkg, pv.ver)
+            result = installFromDir(downloadDir, false, options, pkg.repository)
           else:
-            raise newException(NimbleError, "Package not found.")
+            # If package is not found give the user a chance to update
+            # package.json
+            if doPrompt and
+                options.prompt(pv.name & " not found in local packages.json, " &
+                               "check internet for updated packages?"):
+              update(options)
+              result = install(@[pv], options, false)
+            else:
+              raise newException(NimbleError, "Package not found.")
+
+        #result = installFromDir(downloadDir, false, options, pkg.repository)
+
 
 proc build(options: Options) =
   var pkgInfo = getPkgInfo(getCurrentDir())
@@ -648,38 +605,68 @@ proc search(options: Options) =
     raise newException(NimbleError, "Please specify a search string.")
   if not existsFile(options.getNimbleDir() / "packages.json"):
     raise newException(NimbleError, "Please run nimble update.")
-  let pkgList = getPackageList(options.getNimbleDir() / "packages.json")
+
   var found = false
   template onFound: stmt =
     echoPackage(pkg)
-    if options.queryVersions:
-      echoPackageVersions(pkg)
-    echo(" ")
     found = true
-    break
+
+    if options.queryVersions:
+      var relList = newSeq[Release]()
+
+      if registry.getRegistryUrl(options) != nil:
+        let registryReleases = registry.listReleases(options, pkg.name)
+        relList.add(registryReleases)
+
+      for release in getTaggedReleases(pkg):
+        relList.add(release)
+
+      if relList.len != 0:
+        echo("  versions:    $#" % join(relList.map((r: Release) => (r.version)), ", "))
+
+    echo(" ")
+
+  var pkgList: seq[Pkg]
+  if registry.getRegistryUrl(options) != nil:
+    pkgList = registry.searchPackages(options)
+  else:
+    pkgList = file.searchPackages(options)
 
   for pkg in pkgList:
-    for word in options.action.search:
-      # Search by name.
-      if word.toLower() in pkg.name.toLower():
-        onFound()
-      # Search by tag.
-      for tag in pkg.tags:
-        if word.toLower() in tag.toLower():
-          onFound()
-
+    onFound()
   if not found:
     echo("No package found.")
 
 proc list(options: Options) =
   if not existsFile(options.getNimbleDir() / "packages.json"):
     raise newException(NimbleError, "Please run nimble update.")
-  let pkgList = getPackageList(options.getNimbleDir() / "packages.json")
-  for pkg in pkgList:
+
+  var pkgList: seq[Pkg]
+  if registry.getRegistryUrl(options) != nil:
+    pkgList = registry.listPackages(options)
+  else:
+    pkgList = file.listPackages(options)
+
+  template onFound: stmt =
     echoPackage(pkg)
+
     if options.queryVersions:
-      echoPackageVersions(pkg)
+      var relList = newSeq[Release]()
+
+      if registry.getRegistryUrl(options) != nil:
+        let registryReleases = registry.listReleases(options, pkg.name)
+        relList.add(registryReleases)
+
+      for release in getTaggedReleases(pkg):
+        relList.add(release)
+
+      if relList.len != 0:
+        echo("  versions:    $#" % join(relList.map((r: Release) => (r.version)), ", "))
+
     echo(" ")
+
+  for pkg in pkgList:
+    onFound()
 
 proc listInstalled(options: Options) =
   var h = initTable[string, seq[string]]()
@@ -832,6 +819,8 @@ proc uninstall(options: Options) =
     removePkgDir(options.getPkgsDir / (pkg.name & '-' & pkg.version), options)
     echo("Removed ", pkg.name, " (", $pkg.version, ")")
 
+
+
 proc doAction(options: Options) =
   if not existsDir(options.getNimbleDir()):
     createDir(options.getNimbleDir())
@@ -856,6 +845,8 @@ proc doAction(options: Options) =
     build(options)
   of actionInit:
     init(options)
+  of actionRegister:
+    registry.register(options)
   of actionNil:
     assert false
 

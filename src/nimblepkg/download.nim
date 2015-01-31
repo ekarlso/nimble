@@ -1,11 +1,11 @@
 # Copyright (C) Dominik Picheta. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
-import parseutils, os, osproc, strutils, tables, pegs
+import parseutils, os, osproc, strutils, tables, pegs, parseurl
 
 import packageinfo, version, tools, nimbletypes
 
-type  
+type
   DownloadMethod* {.pure.} = enum
     git = "git", hg = "hg"
 
@@ -106,11 +106,11 @@ proc getTagsListRemote*(url: string, meth: DownloadMethod): seq[string] =
       let start = i.find("refs/tags/")+"refs/tags/".len
       let tag = i[start .. -1]
       if not tag.endswith("^{}"): result.add(tag)
-    
+
   of DownloadMethod.hg:
     # http://stackoverflow.com/questions/2039150/show-tags-for-remote-hg-repository
     raise newException(ValueError, "Hg doesn't support remote tag querying.")
-  
+
 proc getVersionList*(tags: seq[string]): Table[Version, string] =
   # Returns: TTable of version -> git tag name
   result = initTable[Version, string]()
@@ -121,6 +121,7 @@ proc getVersionList*(tags: seq[string]): Table[Version, string] =
       result[newVersion(tag[i .. -1])] = tag
 
 proc getDownloadMethod*(meth: string): DownloadMethod =
+  echo($meth)
   case meth
   of "git": return DownloadMethod.git
   of "hg", "mercurial": return DownloadMethod.hg
@@ -154,7 +155,7 @@ proc doDownload*(url: string, downloadDir: string, verRange: VersionRange,
     var latest = findLatest(verRange, versions)
     ## Note: HEAD is not used when verRange.kind is verAny. This is
     ## intended behaviour, the latest tagged version will be used in this case.
-    
+
     # If no tagged versions satisfy our range latest.tag will be "".
     # We still clone in that scenario because we want to try HEAD in that case.
     # https://github.com/nimrod-code/nimble/issues/22
@@ -169,7 +170,7 @@ proc doDownload*(url: string, downloadDir: string, verRange: VersionRange,
         "Downloaded package's version does not satisfy requested version " &
         "range: wanted $1 got $2." %
         [$verRange, $pkginfo.version])
-  
+
   removeDir(downloadDir)
   if verRange.kind == verSpecial:
     # We want a specific commit/branch/tag here.
@@ -196,18 +197,40 @@ proc doDownload*(url: string, downloadDir: string, verRange: VersionRange,
       else:
         # If no commits have been tagged on the repo we just clone HEAD.
         doClone(downMethod, url, downloadDir) # Grab HEAD.
-      
+
       verifyClone()
     of DownloadMethod.hg:
       doClone(downMethod, url, downloadDir)
       let versions = getTagsList(downloadDir, downMethod).getVersionList()
-    
+
       if versions.len > 0:
         getLatestByTag:
           echo("Switching to latest tagged version: ", latest.tag)
           doCheckout(downMethod, downloadDir, latest.tag)
-      
+
       verifyClone()
+
+proc getTaggedReleases*(pkg: Pkg): seq[Release] =
+  result = newSeq[Release]()
+
+  let downMethod = pkg.repository.checkUrlType()
+
+  case downMethod
+  of DownloadMethod.git:
+    try:
+      let versions = getTagsListRemote(pkg.repository, downMethod).getVersionList()
+      if versions.len > 0:
+        for v in values(versions):
+          result.add(Release(
+            version: v,
+            downloadMethod: $downMethod,
+            uri: $pkg.repository))
+    except OSError:
+      echo(getCurrentExceptionMsg())
+  of DownloadMethod.hg:
+    echo("  versions:    (Remote tag retrieval not supported by " &
+        pkg.repository & ")")
+
 
 proc echoPackageVersions*(pkg: Package) =
   let downMethod = pkg.downloadMethod.getDownloadMethod()

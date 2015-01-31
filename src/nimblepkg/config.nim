@@ -2,13 +2,15 @@
 # BSD License. Look at license.txt for more info.
 import parsecfg, streams, strutils, os
 
-import tools, version, nimbletypes
+import tools, nimbletypes, version
 
 type
   Config* = object
     nimbleDir*: string
     chcp*: bool # Whether to change the code page in .cmd files on Win.
-    
+    registryUrl*: string
+    registryToken*: string
+
 
 proc initConfig(): Config =
   if getNimrodVersion() > newVersion("0.9.6"):
@@ -17,6 +19,8 @@ proc initConfig(): Config =
     result.nimbleDir = getHomeDir() / ".babel"
 
   result.chcp = true
+  #result.registryUrl = nil
+
 
 proc parseConfig*(): Config =
   result = initConfig()
@@ -29,7 +33,7 @@ proc parseConfig*(): Config =
     f = newFileStream(confFile, fmRead)
     if f != nil:
       echo("[Warning] Using deprecated config file at ", confFile)
-  
+
   if f != nil:
     echo("Reading from config file at ", confFile)
     var p: CfgParser
@@ -48,6 +52,10 @@ proc parseConfig*(): Config =
             result.nimbleDir = e.value
         of "chcp":
           result.chcp = parseBool(e.value)
+        of "registryurl":
+          result.registryUrl = e.value
+        of "registrytoken":
+          result.registryToken = e.value
         else:
           raise newException(NimbleError, "Unable to parse config file:" &
                                      " Unknown key: " & e.key)

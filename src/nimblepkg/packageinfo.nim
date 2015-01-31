@@ -1,6 +1,6 @@
 # Copyright (C) Dominik Picheta. All rights reserved.
 # BSD License. Look at license.txt for more info.
-import parsecfg, json, streams, strutils, parseutils, os
+import future, parsecfg, json, streams, strutils, parseutils, os
 import version, tools, nimbletypes
 type
   ## Tuple containing package name and version range.
@@ -37,8 +37,72 @@ type
     dvcsTag*: string
     web*: string # Info url for humans.
 
+  Pkg* = object
+    name*: string
+    description*: string
+    license*: string
+    tags*: seq[string]
+    repository*: string
+    web*: string
+
+  Release* = object
+    id*: int64
+    version*: string
+    downloadMethod*: string
+    uri*: string
+
   MetaData* = object
     url*: string
+
+proc toPkg*(info: PackageInfo): Pkg =
+  result = Pkg(
+    name: info.name,
+    description: info.description,
+    license: info.license
+  )
+
+proc toPkg*(jn: JsonNode): Pkg =
+  result = Pkg(
+    name: jn["name"].str,
+    description: jn["description"].str,
+    license: jn["license"].str,
+    web: jn["web"].str,
+    repository: jn["repository"].str,
+    tags: jn["tags"].elems.map((n: JsonNode) => (n.str))
+  )
+
+
+proc `%`*(pkg: Pkg): JsonNode =
+  result = %{
+    "name": %pkg.name,
+    "license": %pkg.license,
+    "web": %pkg.web
+  }
+
+  if pkg.description != nil:
+    result["description"] = %pkg.description
+
+  if pkg.tags != nil:
+    result["tags"] = %pkg.tags.map(proc(s: string): JsonNode = %s)
+
+proc toRelease*(jn: JsonNode): Release =
+  result = Release(
+    version: jn["version"].str,
+    downloadMethod: jn["method"].str,
+    uri: jn["uri"].str
+  )
+
+proc release*(info: PackageInfo): Release =
+  result = Release(
+    version: info.version
+  )
+
+proc `%`*(release: Release): JsonNode =
+  result = %{
+    "version": %release.version,
+    "method": %release.downloadMethod,
+    "uri": %release.uri
+  }
 
 proc initPackageInfo(): PackageInfo =
   result.mypath = ""
@@ -181,7 +245,7 @@ proc readPackageInfo*(path: string): PackageInfo =
     raise newException(ValueError, "Cannot open package info: " & path)
   validatePackageInfo(result, path)
 
-proc optionalField(obj: JsonNode, name: string, default = ""): string =
+proc optionalField*(obj: JsonNode, name: string, default = ""): string =
   ## Queries ``obj`` for the optional ``name`` string.
   ##
   ## Returns the value of ``name`` if it is a valid string, or aborts execution
@@ -195,30 +259,15 @@ proc optionalField(obj: JsonNode, name: string, default = ""): string =
           " field is of unexpected type.")
   else: return default
 
-proc requiredField(obj: JsonNode, name: string): string =
+proc requiredField*(obj: JsonNode, name: string): string =
   ## Queries ``obj`` for the required ``name`` string.
   ##
   ## Aborts execution if the field does not exist or is of invalid json type.
   result = optionalField(obj, name, nil)
   if result == nil:
-    raise newException(NimbleError, 
+    raise newException(NimbleError,
         "Package in packages.json file does not contain a " & name & " field.")
 
-proc fromJson(obj: JSonNode): Package =
-  ## Constructs a Package object from a JSON node.
-  ##
-  ## Aborts execution if the JSON node doesn't contain the required fields.
-  result.name = obj.requiredField("name")
-  result.version = obj.optionalField("version")
-  result.url = obj.requiredField("url")
-  result.downloadMethod = obj.requiredField("method")
-  result.dvcsTag = obj.optionalField("dvcs-tag")
-  result.license = obj.requiredField("license")
-  result.tags = @[]
-  for t in obj["tags"]:
-    result.tags.add(t.str)
-  result.description = obj.requiredField("description")
-  result.web = obj.optionalField("web")
 
 proc readMetaData*(path: string): MetaData =
   ## Reads the metadata present in ``~/.nimble/pkgs/pkg-0.1/nimblemeta.json``
@@ -235,26 +284,6 @@ proc readMetaData*(path: string): MetaData =
   let cont = readFile(bmeta)
   let jsonmeta = parseJson(cont)
   result.url = jsonmeta["url"].str
-
-proc getPackage*(pkg: string, packagesPath: string, resPkg: var Package): bool =
-  ## Searches ``packagesPath`` file saving into ``resPkg`` the found package.
-  ##
-  ## Pass in ``pkg`` the name of the package you are searching for. As
-  ## convenience the proc returns a boolean specifying if the ``resPkg`` was
-  ## successfully filled with good data.
-  let packages = parseFile(packagesPath)
-  for p in packages:
-    if p["name"].str == pkg:
-      resPkg = p.fromJson()
-      return true
-
-proc getPackageList*(packagesPath: string): seq[Package] =
-  ## Returns the list of packages found at the specified path.
-  result = @[]
-  let packages = parseFile(packagesPath)
-  for p in packages:
-    let pkg: Package = p.fromJson()
-    result.add(pkg)
 
 proc findNimbleFile*(dir: string): string =
   result = ""
@@ -297,7 +326,7 @@ proc findPkg*(pkglist: seq[tuple[pkginfo: PackageInfo, meta: MetaData]],
   ## packages are found the newest one is returned (the one with the highest
   ## version number)
   ##
-  ## **Note**: dep.name here could be a URL, hence the need for pkglist.meta. 
+  ## **Note**: dep.name here could be a URL, hence the need for pkglist.meta.
   for pkg in pkglist:
     if pkg.pkginfo.name.normalize != dep.name.normalize and
        pkg.meta.url.normalize != dep.name.normalize: continue
@@ -335,7 +364,7 @@ proc getNameVersion*(pkgpath: string): tuple[name, version: string] =
   if '-' notin tail:
     result.name = tail
     return
-  
+
   for i in countdown(tail.len-1, 0):
     if tail[i] == '-':
       result.name = tail[0 .. i-1]
@@ -351,7 +380,18 @@ proc echoPackage*(pkg: Package) =
   if pkg.web.len > 0:
     echo("  website:     " & pkg.web)
 
-proc getDownloadDirName*(pkg: Package, verRange: VersionRange): string =
+proc echoPackage*(pkg: Pkg) =
+  echo(pkg.name & ":")
+  echo("  license:     " & pkg.license)
+  echo("  tags:        " & pkg.tags.join(", "))
+  if pkg.description != nil:
+    echo("  description: " & pkg.description)
+  if pkg.web.len > 0:
+    echo("  website:     " & pkg.web)
+  echo("  repository:  " & pkg.repository)
+
+
+proc getDownloadDirName*(pkg: Pkg, verRange: VersionRange): string =
   result = pkg.name
   let verSimple = getSimpleString(verRange)
   if verSimple != "":
